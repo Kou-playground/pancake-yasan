@@ -1,0 +1,1960 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, viewport-fit=cover">
+<title>🥞ホットケーキやさん</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body {
+    width:100%; height:100%; overflow:hidden;
+    background:#2b1d12;
+    touch-action:none; -webkit-user-select:none; user-select:none;
+    overscroll-behavior:none;
+    font-family:"Hiragino Maru Gothic ProN","Hiragino Kaku Gothic ProN","Yu Gothic",sans-serif;
+  }
+  #wrap {
+    position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+    background:#2b1d12;
+  }
+  #game {
+    display:block; touch-action:none;
+    box-shadow:0 0 40px rgba(0,0,0,0.6);
+  }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game"></canvas></div>
+<script>
+"use strict";
+(function(){
+
+/* ============================================================
+   ホットケーキやさん  —  single-file pancake simulator
+   vanilla JS + Canvas2D, procedural textures only.
+   ============================================================ */
+
+// ---------- Canvas / DPR setup ----------
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+
+// Logical (design) resolution — portrait. We scale to fit screen.
+const VW = 432;   // virtual width
+const VH = 768;   // virtual height
+let dpr = 1;
+let scale = 1;        // css scale of the virtual canvas
+let offX = 0, offY = 0;
+
+function resize(){
+  dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+  const ww = window.innerWidth;
+  const wh = window.innerHeight;
+  scale = Math.min(ww / VW, wh / VH);
+  const cssW = VW * scale;
+  const cssH = VH * scale;
+  canvas.style.width = cssW + "px";
+  canvas.style.height = cssH + "px";
+  canvas.width = Math.round(VW * dpr);
+  canvas.height = Math.round(VH * dpr);
+  // map pointer: css pixel -> virtual coords
+  const rect = canvas.getBoundingClientRect();
+  offX = rect.left; offY = rect.top;
+}
+window.addEventListener("resize", resize);
+
+// convert a client pointer event to virtual coords
+function toVirtual(clientX, clientY){
+  const rect = canvas.getBoundingClientRect();
+  const x = (clientX - rect.left) / scale;
+  const y = (clientY - rect.top) / scale;
+  return {x, y};
+}
+
+// ---------- Utility ----------
+const TAU = Math.PI*2;
+function clamp(v,a,b){ return v<a?a:(v>b?b:v); }
+function lerp(a,b,t){ return a+(b-a)*t; }
+function rand(a,b){ return a+Math.random()*(b-a); }
+function dist(x1,y1,x2,y2){ const dx=x2-x1,dy=y2-y1; return Math.sqrt(dx*dx+dy*dy); }
+function easeOutCubic(t){ return 1-Math.pow(1-t,3); }
+function easeInOutQuad(t){ return t<0.5?2*t*t:1-Math.pow(-2*t+2,2)/2; }
+
+// hsl helper
+function hsl(h,s,l,a){ return "hsla("+h+","+s+"%,"+l+"%,"+(a===undefined?1:a)+")"; }
+
+// ---------- Sound (WebAudio synth) ----------
+const Sound = (function(){
+  let actx = null;
+  let muted = false;
+  let master = null;
+  let noiseBuf = null;
+  function ensure(){
+    if(actx) return;
+    try {
+      actx = new (window.AudioContext||window.webkitAudioContext)();
+      master = actx.createGain();
+      master.gain.value = 0.5;
+      master.connect(actx.destination);
+      // build a noise buffer
+      const len = actx.sampleRate * 1.0;
+      noiseBuf = actx.createBuffer(1, len, actx.sampleRate);
+      const d = noiseBuf.getChannelData(0);
+      for(let i=0;i<len;i++) d[i] = Math.random()*2-1;
+    } catch(e){ actx=null; }
+  }
+  function resume(){
+    ensure();
+    if(actx && actx.state === "suspended") actx.resume();
+  }
+  function setMuted(m){ muted=m; if(master) master.gain.value = m?0:0.5; }
+  function isMuted(){ return muted; }
+
+  function tone(freq, dur, type, vol, slideTo){
+    if(!actx||muted) return;
+    const o = actx.createOscillator();
+    const g = actx.createGain();
+    o.type = type||"sine";
+    o.frequency.value = freq;
+    if(slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, actx.currentTime+dur);
+    g.gain.value = vol||0.3;
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime+dur);
+    o.connect(g); g.connect(master);
+    o.start(); o.stop(actx.currentTime+dur);
+  }
+  function noise(dur, vol, lp, hp){
+    if(!actx||muted) return;
+    const s = actx.createBufferSource();
+    s.buffer = noiseBuf;
+    const g = actx.createGain();
+    g.gain.value = vol||0.2;
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime+dur);
+    let node = s;
+    if(lp){ const f=actx.createBiquadFilter(); f.type="lowpass"; f.frequency.value=lp; node.connect(f); node=f; }
+    if(hp){ const f=actx.createBiquadFilter(); f.type="highpass"; f.frequency.value=hp; node.connect(f); node=f; }
+    node.connect(g); g.connect(master);
+    s.start(); s.stop(actx.currentTime+dur);
+  }
+
+  // named SFX
+  return {
+    resume, setMuted, isMuted, ensure,
+    crack(){ noise(0.12,0.4,4000,800); tone(220,0.1,"square",0.15,90); },
+    plop(){ tone(440,0.12,"sine",0.25,140); },
+    stir(){ noise(0.08,0.07,3000,1200); },
+    pour(){ noise(0.5,0.12,1500,400); },
+    sizzle(v){ noise(0.25,(v||0.06),2200,600); },
+    bubble(){ tone(900,0.05,"sine",0.12,500); },
+    flip(){ tone(300,0.25,"sine",0.2,1200); noise(0.2,0.08,4000,1000); },
+    click(){ tone(660,0.06,"triangle",0.18); },
+    win(){
+      if(!actx||muted) return;
+      const seq=[523,659,784,1046];
+      seq.forEach((f,i)=> setTimeout(()=>tone(f,0.3,"triangle",0.25), i*120));
+    },
+    sparkle(){ tone(1400,0.12,"sine",0.12,2600); }
+  };
+})();
+
+// ---------- Input (pointer) ----------
+const pointer = { x:VW/2, y:VH/2, down:false, justDown:false, justUp:false, px:VW/2, py:VH/2, vx:0, vy:0, moved:false };
+let pendingDown=false, pendingUp=false;
+
+function onPointerDown(e){
+  Sound.resume();
+  const p = toVirtual(e.clientX, e.clientY);
+  pointer.x=p.x; pointer.y=p.y; pointer.px=p.x; pointer.py=p.y;
+  pointer.down=true; pendingDown=true;
+  e.preventDefault();
+}
+function onPointerMove(e){
+  const p = toVirtual(e.clientX, e.clientY);
+  pointer.x=p.x; pointer.y=p.y;
+  e.preventDefault();
+}
+function onPointerUp(e){
+  pointer.down=false; pendingUp=true;
+  e.preventDefault();
+}
+canvas.addEventListener("pointerdown", onPointerDown, {passive:false});
+canvas.addEventListener("pointermove", onPointerMove, {passive:false});
+window.addEventListener("pointerup", onPointerUp, {passive:false});
+window.addEventListener("pointercancel", onPointerUp, {passive:false});
+// guard against context menu / gestures
+window.addEventListener("contextmenu", e=>e.preventDefault());
+document.addEventListener("gesturestart", e=>e.preventDefault());
+
+// per-frame pointer bookkeeping
+function pointerBegin(){
+  pointer.justDown = pendingDown; pendingDown=false;
+  pointer.justUp = pendingUp; pendingUp=false;
+  pointer.vx = pointer.x - pointer.px;
+  pointer.vy = pointer.y - pointer.py;
+  pointer.moved = Math.abs(pointer.vx)+Math.abs(pointer.vy) > 0.5;
+}
+function pointerEnd(){
+  pointer.px = pointer.x; pointer.py = pointer.y;
+}
+
+// ---------- Buttons ----------
+const buttons = []; // active clickable buttons this frame
+function addButton(b){ buttons.push(b); }
+function clearButtons(){ buttons.length=0; }
+// b: {x,y,w,h,r, label, color, text, onClick, sub, enabled, pulse}
+function drawButtons(){
+  for(const b of buttons){
+    drawButton(b);
+  }
+}
+function drawButton(b){
+  const r = b.r!==undefined?b.r:Math.min(b.w,b.h)/2;
+  const en = b.enabled!==false;
+  const hot = en && pointInRect(pointer.x,pointer.y,b) && pointer.down;
+  ctx.save();
+  const yo = hot?3:0;
+  // shadow
+  ctx.fillStyle="rgba(0,0,0,0.25)";
+  roundRect(b.x, b.y+6, b.w, b.h, r); ctx.fill();
+  // body
+  let col = b.color||"#ff8fb1";
+  if(!en) col="#b9b0a8";
+  const g = ctx.createLinearGradient(0,b.y+yo,0,b.y+b.h+yo);
+  g.addColorStop(0, lightenHex(col, 18));
+  g.addColorStop(1, col);
+  ctx.fillStyle=g;
+  roundRect(b.x, b.y+yo, b.w, b.h, r); ctx.fill();
+  // top gloss
+  ctx.fillStyle="rgba(255,255,255,0.35)";
+  roundRect(b.x+8, b.y+yo+6, b.w-16, b.h*0.32, r*0.6); ctx.fill();
+  // pulse ring
+  if(b.pulse && en){
+    const pr = (Math.sin(time*0.006)*0.5+0.5);
+    ctx.strokeStyle="rgba(255,255,255,"+(0.3+pr*0.5)+")";
+    ctx.lineWidth=3+pr*3;
+    roundRect(b.x-2, b.y+yo-2, b.w+4, b.h+4, r+2); ctx.stroke();
+  }
+  // label
+  ctx.fillStyle = en?"#5a2a18":"#7c736b";
+  ctx.textAlign="center"; ctx.textBaseline="middle";
+  const fs = b.fontSize||Math.min(b.h*0.42, 30);
+  ctx.font = "bold "+fs+"px sans-serif";
+  ctx.fillText(b.text, b.x+b.w/2, b.y+b.h/2+yo + (b.sub?-8:0));
+  if(b.sub){
+    ctx.font = "bold "+(fs*0.5)+"px sans-serif";
+    ctx.fillText(b.sub, b.x+b.w/2, b.y+b.h/2+yo+fs*0.55);
+  }
+  ctx.restore();
+}
+function pointInRect(px,py,b){ return px>=b.x&&px<=b.x+b.w&&py>=b.y&&py<=b.y+b.h; }
+function processButtons(){
+  if(pointer.justUp){
+    for(const b of buttons){
+      if(b.enabled!==false && pointInRect(pointer.x,pointer.y,b)){
+        Sound.click();
+        if(b.onClick) b.onClick();
+        break;
+      }
+    }
+  }
+}
+function roundRect(x,y,w,h,r){
+  r=Math.min(r,w/2,h/2);
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);
+  ctx.arcTo(x,y,x+w,y,r);
+  ctx.closePath();
+}
+function lightenHex(hex, amt){
+  // hex "#rrggbb" -> lighten by amt (0-100)
+  if(hex[0]!=="#"||hex.length<7) return hex;
+  let r=parseInt(hex.slice(1,3),16),g=parseInt(hex.slice(3,5),16),b=parseInt(hex.slice(5,7),16);
+  r=clamp(r+amt*2.55,0,255);g=clamp(g+amt*2.55,0,255);b=clamp(b+amt*2.55,0,255);
+  return "rgb("+(r|0)+","+(g|0)+","+(b|0)+")";
+}
+
+// ---------- Banner / instruction text ----------
+let banner = { text:"", t:0, dur:0 };
+function showBanner(txt, dur){ banner.text=txt; banner.t=time; banner.dur=dur||2600; }
+function drawInstruction(txt){
+  // persistent top instruction
+  ctx.save();
+  ctx.textAlign="center"; ctx.textBaseline="top";
+  ctx.font="bold 26px sans-serif";
+  const w = ctx.measureText(txt).width+40;
+  const x=(VW-w)/2, y=86;
+  ctx.fillStyle="rgba(90,42,24,0.82)";
+  roundRect(x,y,w,46,23); ctx.fill();
+  ctx.fillStyle="#fff7e8";
+  ctx.fillText(txt, VW/2, y+10);
+  ctx.restore();
+}
+function drawBanner(){
+  if(!banner.text) return;
+  const el = time-banner.t;
+  if(el>banner.dur){ banner.text=""; return; }
+  let a=1;
+  if(el<200) a=el/200;
+  else if(el>banner.dur-400) a=(banner.dur-el)/400;
+  ctx.save();
+  ctx.globalAlpha=clamp(a,0,1);
+  ctx.textAlign="center"; ctx.textBaseline="middle";
+  ctx.font="bold 40px sans-serif";
+  const pop = el<300 ? easeOutCubic(el/300) : 1;
+  ctx.translate(VW/2, VH*0.4);
+  ctx.scale(0.8+pop*0.2, 0.8+pop*0.2);
+  ctx.lineWidth=8; ctx.strokeStyle="#fff";
+  ctx.strokeText(banner.text,0,0);
+  ctx.fillStyle="#ff5a8a";
+  ctx.fillText(banner.text,0,0);
+  ctx.restore();
+}
+
+// ---------- Particles (generic) ----------
+const particles = [];
+function spawnParticle(p){ particles.push(p); }
+function updateParticles(dt){
+  for(let i=particles.length-1;i>=0;i--){
+    const p=particles[i];
+    p.vy += (p.g||0)*dt;
+    p.x += p.vx*dt; p.y += p.vy*dt;
+    p.life -= dt;
+    if(p.rot!==undefined) p.rot += (p.spin||0)*dt;
+    if(p.life<=0) particles.splice(i,1);
+  }
+}
+function drawParticles(){
+  for(const p of particles){
+    const a = clamp(p.life/(p.life0||p.life+1),0,1);
+    ctx.save();
+    ctx.globalAlpha = a*(p.alpha||1);
+    if(p.type==="star"){
+      ctx.translate(p.x,p.y); ctx.rotate(p.rot||0);
+      drawStar(0,0,p.r, p.r*0.45, 5, p.color||"#fff36b");
+    } else if(p.type==="ring"){
+      ctx.strokeStyle=p.color||"#fff"; ctx.lineWidth=p.lw||3;
+      ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,TAU); ctx.stroke();
+    } else {
+      ctx.fillStyle=p.color||"#fff";
+      ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+}
+function drawStar(cx,cy,outer,inner,points,color){
+  ctx.beginPath();
+  for(let i=0;i<points*2;i++){
+    const r = i%2===0?outer:inner;
+    const a = (i/(points*2))*TAU - Math.PI/2;
+    const x=cx+Math.cos(a)*r, y=cy+Math.sin(a)*r;
+    if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  }
+  ctx.closePath();
+  ctx.fillStyle=color; ctx.fill();
+}
+
+// ============================================================
+//  GAME STATE
+// ============================================================
+const STATE = {
+  TITLE:"TITLE", CRACK:"CRACK", MIX_EGG:"MIX_EGG",
+  ADD_DRY:"ADD_DRY", MIX_BATTER:"MIX_BATTER",
+  POUR:"POUR", COOK1:"COOK1", FLIP:"FLIP", COOK2:"COOK2",
+  RESULT:"RESULT"
+};
+let state = STATE.TITLE;
+let stateTime = 0;     // time since entering state
+let time = 0;          // global ms clock
+
+// gameplay scoring data persisted across phases
+const game = {
+  eggMix: 0,        // 0..1 final egg mix quality
+  batterMix: 0,     // 0..1 batter homogeneity
+  lumps: 1,         // remaining lumps fraction
+  overmix: 0,       // overmix penalty
+  pourAmount: 0,    // 0..1 size
+  flipTiming: 0,    // -1..1 (0 = perfect); store quality 0..1
+  flipQuality: 0,
+  doneness1: 0,     // top side
+  doneness2: 0,     // bottom side
+  flipResult: "",   // "nice"/"early"/"late"
+};
+
+function resetGame(){
+  game.eggMix=0; game.batterMix=0; game.lumps=1; game.overmix=0;
+  game.pourAmount=0; game.flipTiming=0; game.flipQuality=0;
+  game.doneness1=0; game.doneness2=0; game.flipResult="";
+}
+
+function setState(s){
+  state = s;
+  stateTime = 0;
+  onEnterState(s);
+}
+
+// ---------- Background ----------
+let bgCache = null;
+function buildBackground(){
+  const c = document.createElement("canvas");
+  c.width=VW; c.height=VH;
+  const x=c.getContext("2d");
+  const g=x.createLinearGradient(0,0,0,VH);
+  g.addColorStop(0,"#ffe7c2");
+  g.addColorStop(0.5,"#ffd49a");
+  g.addColorStop(1,"#f7b977");
+  x.fillStyle=g; x.fillRect(0,0,VW,VH);
+  // soft polka dots
+  for(let i=0;i<60;i++){
+    const px=rand(0,VW), py=rand(0,VH), r=rand(6,18);
+    x.fillStyle="rgba(255,255,255,"+rand(0.04,0.12)+")";
+    x.beginPath(); x.arc(px,py,r,0,TAU); x.fill();
+  }
+  // wood table at bottom
+  const tableY=VH*0.78;
+  const wg=x.createLinearGradient(0,tableY,0,VH);
+  wg.addColorStop(0,"#c98a52"); wg.addColorStop(1,"#a96a36");
+  x.fillStyle=wg; x.fillRect(0,tableY,VW,VH-tableY);
+  for(let i=0;i<24;i++){
+    x.strokeStyle="rgba(120,70,30,"+rand(0.08,0.2)+")";
+    x.lineWidth=rand(1,3);
+    const yy=tableY+rand(0,VH-tableY);
+    x.beginPath(); x.moveTo(0,yy);
+    for(let xx=0;xx<=VW;xx+=20) x.lineTo(xx, yy+Math.sin(xx*0.05+i)*2);
+    x.stroke();
+  }
+  bgCache=c;
+}
+function drawBackground(){
+  if(bgCache) ctx.drawImage(bgCache,0,0);
+}
+
+// ---------- Bowl drawing (shared) ----------
+// Bowl geometry in mix scenes
+const BOWL = { cx:VW/2, cy:VH*0.5, rx:160, ry:120, depth:150 };
+function drawBowlBack(){
+  const {cx,cy,rx,ry,depth}=BOWL;
+  ctx.save();
+  // outer bowl body (lower half)
+  ctx.beginPath();
+  ctx.moveTo(cx-rx,cy);
+  ctx.bezierCurveTo(cx-rx,cy+depth*0.9, cx+rx,cy+depth*0.9, cx+rx,cy);
+  ctx.closePath();
+  const bg=ctx.createLinearGradient(cx-rx,cy,cx+rx,cy);
+  bg.addColorStop(0,"#d8e8f2"); bg.addColorStop(0.5,"#f4fbff"); bg.addColorStop(1,"#bcd4e6");
+  ctx.fillStyle=bg; ctx.fill();
+  // inner shadow (the cavity behind liquid)
+  ctx.beginPath();
+  ctx.ellipse(cx,cy,rx-8,ry-8,0,0,Math.PI);
+  ctx.fillStyle="#9fb4c4"; ctx.fill();
+  ctx.restore();
+}
+function drawBowlRim(){
+  const {cx,cy,rx,ry}=BOWL;
+  ctx.save();
+  // rim ellipse
+  ctx.lineWidth=14;
+  const rg=ctx.createLinearGradient(cx-rx,cy-ry,cx+rx,cy+ry);
+  rg.addColorStop(0,"#eaf4fb"); rg.addColorStop(0.5,"#ffffff"); rg.addColorStop(1,"#c4d8e8");
+  ctx.strokeStyle=rg;
+  ctx.beginPath(); ctx.ellipse(cx,cy,rx,ry,0,0,TAU); ctx.stroke();
+  // rim highlight
+  ctx.lineWidth=4; ctx.strokeStyle="rgba(255,255,255,0.7)";
+  ctx.beginPath(); ctx.ellipse(cx-3,cy-3,rx-3,ry-3,0,Math.PI*1.1,Math.PI*1.7); ctx.stroke();
+  ctx.restore();
+}
+
+// ============================================================
+//  EGG-MIX  (the star of the show)  — fluid marbling sim
+// ============================================================
+const Fluid = (function(){
+  // offscreen canvas holds the liquid texture.
+  const FW = 320, FH = 240;       // fluid texture resolution
+  let fc, fx;          // current
+  let tc, tx;          // temp/back buffer for smear
+  let initialized=false;
+  let progress=0;      // 0..1 mixedness
+  let strokeDist=0;
+  let swirlPhase=0;
+
+  function init(){
+    fc=document.createElement("canvas"); fc.width=FW; fc.height=FH; fx=fc.getContext("2d");
+    tc=document.createElement("canvas"); tc.width=FW; tc.height=FH; tx=tc.getContext("2d");
+    initialized=true;
+  }
+  function reset(mode){
+    if(!initialized) init();
+    progress=0; strokeDist=0;
+    // mode: "egg" or "batter"
+    fx.clearRect(0,0,FW,FH);
+    if(mode==="egg"){
+      // whites: translucent pale base
+      const g=fx.createLinearGradient(0,0,0,FH);
+      g.addColorStop(0,"#fdf6df"); g.addColorStop(1,"#f3eccf");
+      fx.fillStyle=g; fx.fillRect(0,0,FW,FH);
+      // translucent white blobs (egg whites)
+      for(let i=0;i<14;i++){
+        const x=rand(FW*0.2,FW*0.8),y=rand(FH*0.25,FH*0.8),r=rand(20,46);
+        const wg=fx.createRadialGradient(x,y,2,x,y,r);
+        wg.addColorStop(0,"rgba(255,255,250,0.7)");
+        wg.addColorStop(1,"rgba(245,240,215,0)");
+        fx.fillStyle=wg; fx.beginPath(); fx.arc(x,y,r,0,TAU); fx.fill();
+      }
+      // two strong yolks
+      drawYolk(FW*0.40, FH*0.42, 46);
+      drawYolk(FW*0.60, FH*0.58, 50);
+    } else {
+      // batter: creamy base + lumps + milk swirl
+      const g=fx.createLinearGradient(0,0,0,FH);
+      g.addColorStop(0,"#fdeec0"); g.addColorStop(1,"#f7e3a8");
+      fx.fillStyle=g; fx.fillRect(0,0,FW,FH);
+      // flour streaks (white)
+      for(let i=0;i<10;i++){
+        const x=rand(FW*0.15,FW*0.85),y=rand(FH*0.2,FH*0.85),r=rand(26,60);
+        const wg=fx.createRadialGradient(x,y,2,x,y,r);
+        wg.addColorStop(0,"rgba(255,255,250,0.85)");
+        wg.addColorStop(1,"rgba(255,255,250,0)");
+        fx.fillStyle=wg; fx.beginPath(); fx.arc(x,y,r,0,TAU); fx.fill();
+      }
+    }
+  }
+  function drawYolk(x,y,r){
+    const g=fx.createRadialGradient(x-r*0.3,y-r*0.3,2,x,y,r);
+    g.addColorStop(0,"#ffd83a");
+    g.addColorStop(0.5,"#ffc21e");
+    g.addColorStop(0.85,"#f6a800");
+    g.addColorStop(1,"rgba(246,168,0,0.2)");
+    fx.fillStyle=g; fx.beginPath(); fx.arc(x,y,r,0,TAU); fx.fill();
+    // yolk highlight
+    fx.fillStyle="rgba(255,255,200,0.6)";
+    fx.beginPath(); fx.arc(x-r*0.32,y-r*0.32,r*0.22,0,TAU); fx.fill();
+  }
+
+  // smear the fluid along pointer motion in fluid-space
+  // px,py,ppx,ppy in fluid coords; speed for brush strength
+  function smear(px,py,ppx,ppy){
+    const dx=px-ppx, dy=py-ppy;
+    const len=Math.sqrt(dx*dx+dy*dy);
+    if(len<0.01) return;
+    const steps=Math.min(14, Math.max(2, (len/4)|0));
+    // copy current to temp
+    tx.clearRect(0,0,FW,FH);
+    tx.drawImage(fc,0,0);
+    // direction normal for swirl
+    const nx=-dy/len, ny=dx/len;
+    swirlPhase+=0.4;
+    const brushR = 26;
+    for(let s=0;s<steps;s++){
+      const t=s/steps;
+      const bx=lerp(ppx,px,t);
+      const by=lerp(ppy,py,t);
+      // pull the fluid: draw a displaced copy of the region behind the brush
+      // offset opposite to motion (drag the paint forward), plus swirl
+      const sw = Math.sin(swirlPhase+t*3)*6;
+      const oxx = -dx*0.5 + nx*sw;
+      const oyy = -dy*0.5 + ny*sw;
+      fx.save();
+      fx.globalAlpha = 0.42;
+      fx.beginPath();
+      fx.arc(bx,by,brushR,0,TAU);
+      fx.clip();
+      fx.drawImage(tc, oxx, oyy);
+      fx.restore();
+    }
+    // accumulate progress: distance + a bonus for circular (swirl) motion
+    strokeDist += len;
+    // circular detection: cross product magnitude of consecutive moves
+    const target = 5200; // distance to reach ~full mix
+    progress = clamp(strokeDist/target, 0, 1);
+    return len;
+  }
+
+  // gradually blur/homogenize toward pale yellow as progress rises (egg)
+  function relax(mode, dt){
+    // light averaging: draw self scaled to simulate diffusion when stirred
+    // We do a subtle box-ish blur by drawing translucent offset copies.
+    if(progress<=0) return;
+    const amt = 0.012 * (0.4+progress);
+    tx.clearRect(0,0,FW,FH);
+    tx.drawImage(fc,0,0);
+    fx.save();
+    fx.globalAlpha=amt;
+    fx.drawImage(tc,1,0); fx.drawImage(tc,-1,0);
+    fx.drawImage(tc,0,1); fx.drawImage(tc,0,-1);
+    fx.restore();
+    // tint toward homogeneous color as progress completes
+    if(progress>0.4){
+      fx.save();
+      const target = mode==="egg" ? "rgba(255,216,90," : "rgba(250,232,170,";
+      fx.globalAlpha = (progress-0.4)*0.0045;
+      fx.fillStyle = target+"1)";
+      fx.fillRect(0,0,FW,FH);
+      fx.restore();
+    }
+  }
+
+  function getProgress(){ return progress; }
+  function getCanvas(){ return fc; }
+  function getSize(){ return {FW,FH}; }
+  return { reset, smear, relax, getProgress, getCanvas, getSize };
+})();
+
+// ----- Mix scene shared rendering -----
+// maps bowl interior region; fluid drawn clipped to ellipse
+function drawFluidInBowl(splashList){
+  const {cx,cy,rx,ry}=BOWL;
+  const inR = rx-14, inRy=ry-10;
+  const fcv = Fluid.getCanvas();
+  const {FW,FH}=Fluid.getSize();
+  ctx.save();
+  ctx.beginPath();
+  ctx.ellipse(cx,cy,inR,inRy,0,0,TAU);
+  ctx.clip();
+  // draw fluid texture stretched into ellipse bounding box
+  ctx.drawImage(fcv, cx-inR, cy-inRy, inR*2, inRy*2);
+
+  // liquid surface gloss — moving highlight band
+  const ph = Math.sin(time*0.002);
+  ctx.globalAlpha=0.28;
+  const gg=ctx.createLinearGradient(cx-inR, cy-inRy, cx+inR, cy+inRy*0.4);
+  gg.addColorStop(clamp(0.3+ph*0.1,0,1),"rgba(255,255,255,0)");
+  gg.addColorStop(clamp(0.5+ph*0.1,0,1),"rgba(255,255,255,0.9)");
+  gg.addColorStop(clamp(0.7+ph*0.1,0,1),"rgba(255,255,255,0)");
+  ctx.fillStyle=gg;
+  ctx.fillRect(cx-inR,cy-inRy,inR*2,inRy*1.2);
+  ctx.globalAlpha=1;
+
+  // inner rim shadow for depth
+  ctx.lineWidth=10;
+  ctx.strokeStyle="rgba(120,90,40,0.18)";
+  ctx.beginPath(); ctx.ellipse(cx,cy,inR,inRy,0,0,TAU); ctx.stroke();
+  ctx.restore();
+}
+
+// whisk drawing
+function drawWhisk(x,y,angle){
+  ctx.save();
+  ctx.translate(x,y);
+  ctx.rotate(angle);
+  // handle
+  const hg=ctx.createLinearGradient(0,-90,0,-30);
+  hg.addColorStop(0,"#cfd6dc"); hg.addColorStop(1,"#9aa4ad");
+  ctx.fillStyle=hg;
+  roundRect(-8,-92,16,64,8); ctx.fill();
+  ctx.fillStyle="#7d868f";
+  roundRect(-6,-34,12,12,4); ctx.fill();
+  // wires (loops)
+  ctx.strokeStyle="#c7ced4"; ctx.lineWidth=3.2;
+  for(let i=0;i<5;i++){
+    const w = 6 + i*4;
+    ctx.beginPath();
+    ctx.moveTo(0,-26);
+    ctx.bezierCurveTo(-w-6, -10, -w, 22, 0, 30);
+    ctx.bezierCurveTo(w, 22, w+6, -10, 0, -26);
+    ctx.stroke();
+  }
+  // metallic highlight
+  ctx.strokeStyle="rgba(255,255,255,0.6)"; ctx.lineWidth=1.2;
+  ctx.beginPath(); ctx.moveTo(-3,-88); ctx.lineTo(-3,-34); ctx.stroke();
+  ctx.restore();
+}
+
+// progress meter at top
+function drawMeter(label, value, overzone){
+  const x=36, y=44, w=VW-120, h=26;
+  ctx.save();
+  ctx.fillStyle="rgba(255,255,255,0.5)";
+  roundRect(x-4,y-22,w+8,h+30,16); ctx.fill();
+  ctx.fillStyle="#fff";
+  roundRect(x,y,w,h,h/2); ctx.fill();
+  // overmix zone marker
+  if(overzone){
+    ctx.fillStyle="rgba(255,120,120,0.55)";
+    const ox=x+w*overzone.start, ow=w*(overzone.end-overzone.start);
+    roundRect(ox,y,ow,h,0); ctx.fill();
+  }
+  // fill
+  const fillw = w*clamp(value,0,1);
+  const fg=ctx.createLinearGradient(x,0,x+w,0);
+  fg.addColorStop(0,"#7bdc6a"); fg.addColorStop(0.6,"#ffe14d"); fg.addColorStop(1,"#ff9d4d");
+  ctx.fillStyle=fg;
+  roundRect(x,y,Math.max(fillw,h),h,h/2); ctx.fill();
+  // border
+  ctx.lineWidth=3; ctx.strokeStyle="#5a2a18";
+  roundRect(x,y,w,h,h/2); ctx.stroke();
+  // label
+  ctx.fillStyle="#5a2a18"; ctx.textAlign="left"; ctx.textBaseline="bottom";
+  ctx.font="bold 18px sans-serif";
+  ctx.fillText(label, x+2, y-4);
+  ctx.restore();
+}
+
+// ============================================================
+//  PHASE: TITLE
+// ============================================================
+function updateTitle(dt){}
+function drawTitle(){
+  drawBackground();
+  // floating decorative pancakes
+  for(let i=0;i<4;i++){
+    const px=VW*(0.2+i*0.2), py=VH*0.66 + Math.sin(time*0.001+i)*10;
+    drawMiniPancake(px,py, 26+i%2*6, 0.6);
+  }
+  ctx.save();
+  ctx.textAlign="center";
+  // logo plate
+  const ly=VH*0.26;
+  ctx.font="bold 90px sans-serif";
+  ctx.textBaseline="middle";
+  const bob=Math.sin(time*0.003)*8;
+  ctx.fillText("🥞", VW/2, ly-70+bob);
+  // title text with outline
+  ctx.font="bold 54px sans-serif";
+  ctx.lineWidth=10; ctx.strokeStyle="#fff";
+  ctx.strokeText("ホットケーキ", VW/2, ly+30);
+  const tg=ctx.createLinearGradient(0,ly,0,ly+60);
+  tg.addColorStop(0,"#ff8a3d"); tg.addColorStop(1,"#e8542c");
+  ctx.fillStyle=tg;
+  ctx.fillText("ホットケーキ", VW/2, ly+30);
+  ctx.lineWidth=10; ctx.strokeStyle="#fff";
+  ctx.strokeText("やさん", VW/2, ly+92);
+  ctx.fillStyle="#ff5a8a";
+  ctx.fillText("やさん", VW/2, ly+92);
+  ctx.restore();
+
+  // start button
+  addButton({x:VW/2-130, y:VH*0.62, w:260, h:84, r:42,
+    text:"はじめる", color:"#ff8fb1", pulse:true, fontSize:38,
+    onClick(){ resetGame(); setState(STATE.CRACK); }});
+
+  ctx.save();
+  ctx.fillStyle="#5a2a18"; ctx.textAlign="center"; ctx.font="bold 18px sans-serif";
+  ctx.fillText("タップしてあそぼう！", VW/2, VH*0.62+120);
+  ctx.restore();
+}
+function drawMiniPancake(x,y,r,a){
+  ctx.save(); ctx.globalAlpha=a;
+  ctx.translate(x,y); ctx.scale(1,0.5);
+  ctx.fillStyle="#d99440"; ctx.beginPath(); ctx.arc(0,0,r,0,TAU); ctx.fill();
+  ctx.fillStyle="#f0c070"; ctx.beginPath(); ctx.arc(0,-r*0.1,r*0.85,0,TAU); ctx.fill();
+  ctx.restore();
+}
+
+// ============================================================
+//  PHASE: CRACK eggs
+// ============================================================
+const crackData = { eggs:[], poured:0 };
+function initCrack(){
+  crackData.eggs = [
+    { x:VW*0.36, y:VH*0.30, taps:0, broken:false, cracks:[], wob:0 },
+    { x:VW*0.64, y:VH*0.30, taps:0, broken:false, cracks:[], wob:0 }
+  ];
+  crackData.poured=0;
+  // yolk pools accumulate in bowl
+  crackData.pools=[];
+}
+function updateCrack(dt){
+  for(const e of crackData.eggs){
+    e.wob *= 0.9;
+    if(pointer.justUp && !e.broken){
+      if(dist(pointer.x,pointer.y,e.x,e.y) < 70){
+        e.taps++;
+        e.wob = 1;
+        Sound.crack();
+        // add a crack line
+        const ang=rand(0,TAU);
+        e.cracks.push({a:ang, len:rand(20,40)});
+        if(e.taps>=2){
+          e.broken=true;
+          Sound.plop();
+          // spawn falling yolk + whites into bowl
+          spawnEggFall(e.x, e.y);
+          crackData.poured++;
+        }
+      }
+    }
+  }
+  updateParticles(dt);
+  // animate fall pools settling
+  for(const p of crackData.pools){
+    if(p.y<p.target){ p.vy+=0.002*dt; p.y+=p.vy*dt; if(p.y>=p.target){p.y=p.target; p.settled=true; p.wob=1;} }
+    if(p.settled){ p.wob*=0.92; }
+  }
+  if(crackData.poured>=2 && allSettled() && stateTime>900){
+    // auto-advance after both poured & settle
+    if(!crackData.done){ crackData.done=true; }
+  }
+}
+function allSettled(){ return crackData.pools.every(p=>p.settled); }
+function spawnEggFall(x,y){
+  const {cx,cy}=BOWL;
+  const tx = cx + rand(-40,40);
+  const ty = cy + rand(-10,30);
+  crackData.pools.push({ x:tx, y:y+30, target:ty, vy:0, r:rand(34,42), settled:false, wob:0,
+    hl:rand(-0.3,0.3) });
+  // white splash particles
+  for(let i=0;i<8;i++){
+    spawnParticle({x:x+rand(-20,20),y:y+20,vx:rand(-0.1,0.1),vy:rand(0.05,0.2),g:0.002,
+      r:rand(3,7),life:600,life0:600,color:"rgba(255,250,220,0.7)"});
+  }
+}
+function drawCrack(){
+  drawBackground();
+  drawInstruction(crackData.poured<2 ? "たまごを 2かい タップして わってね！" : "つぎへ すすもう！");
+  drawMeter("たまご", crackData.poured/2);
+
+  // bowl (back + liquid pools + rim)
+  drawBowlBack();
+  // egg pools in bowl
+  const {cx,cy,rx,ry}=BOWL;
+  ctx.save();
+  ctx.beginPath(); ctx.ellipse(cx,cy,rx-14,ry-10,0,0,TAU); ctx.clip();
+  for(const p of crackData.pools){
+    // white spread
+    ctx.fillStyle="rgba(250,244,214,0.55)";
+    ctx.beginPath(); ctx.ellipse(p.x,p.y,p.r*1.5,p.r*0.9*(1+p.wob*0.1),0,0,TAU); ctx.fill();
+    // yolk
+    const wob = 1+Math.sin(time*0.01)*0.04*p.wob;
+    const g=ctx.createRadialGradient(p.x-p.r*0.3,p.y-p.r*0.3,2,p.x,p.y,p.r);
+    g.addColorStop(0,"#ffd83a"); g.addColorStop(0.6,"#ffc21e"); g.addColorStop(1,"#f0a000");
+    ctx.fillStyle=g;
+    ctx.beginPath(); ctx.ellipse(p.x,p.y,p.r*wob,p.r*0.8*wob,0,0,TAU); ctx.fill();
+    ctx.fillStyle="rgba(255,255,210,0.7)";
+    ctx.beginPath(); ctx.arc(p.x-p.r*0.3,p.y-p.r*0.3,p.r*0.2,0,TAU); ctx.fill();
+  }
+  ctx.restore();
+  drawBowlRim();
+  drawParticles();
+
+  // whole eggs sitting above
+  for(const e of crackData.eggs){
+    if(!e.broken) drawEgg(e);
+  }
+
+  // next button when done
+  if(crackData.poured>=2){
+    addButton({x:VW/2-120, y:VH*0.82, w:240, h:70, r:35,
+      text:"つぎへ", color:"#ffd24d", pulse:true,
+      onClick(){ setState(STATE.MIX_EGG); }});
+  }
+}
+function drawEgg(e){
+  ctx.save();
+  ctx.translate(e.x, e.y + Math.sin(time*0.02)*e.wob*4);
+  ctx.rotate(Math.sin(time*0.03)*e.wob*0.08);
+  ctx.scale(1, 1.25);
+  const g=ctx.createRadialGradient(-12,-16,4,0,0,46);
+  g.addColorStop(0,"#fffefb"); g.addColorStop(0.7,"#fdf3e0"); g.addColorStop(1,"#e9d7bd");
+  ctx.fillStyle=g;
+  ctx.beginPath(); ctx.arc(0,0,40,0,TAU); ctx.fill();
+  ctx.restore();
+  // crack lines (drawn unscaled around egg)
+  ctx.save();
+  ctx.translate(e.x,e.y);
+  ctx.strokeStyle="#b89a78"; ctx.lineWidth=2.5;
+  if(e.taps>=1){
+    // a jagged crack across
+    ctx.beginPath();
+    ctx.moveTo(-32,-4);
+    let cx2=-32, cy2=-4;
+    for(let i=0;i<7;i++){ cx2+=9; cy2+=rand(-6,6); ctx.lineTo(cx2,cy2); }
+    ctx.stroke();
+  }
+  for(const c of e.cracks){
+    ctx.beginPath();
+    ctx.moveTo(0,0);
+    ctx.lineTo(Math.cos(c.a)*c.len, Math.sin(c.a)*c.len*1.2);
+    ctx.stroke();
+  }
+  ctx.restore();
+  // tap hint
+  if(e.taps===0){
+    ctx.save();
+    ctx.globalAlpha=0.6+Math.sin(time*0.006)*0.3;
+    ctx.fillStyle="#fff"; ctx.font="bold 22px sans-serif"; ctx.textAlign="center";
+    ctx.fillText("👆", e.x, e.y-56);
+    ctx.restore();
+  }
+}
+
+// ============================================================
+//  PHASE: MIX_EGG
+// ============================================================
+const mixEgg = { whiskAngle:0, lastInBowl:false, splashes:[], bubbles:[] };
+function initMixEgg(){
+  Fluid.reset("egg");
+  mixEgg.whiskAngle=0; mixEgg.bubbles=[];
+  showBanner("まぜまぜしよう！", 1800);
+}
+function fluidCoordsFromPointer(){
+  // map pointer (virtual) into fluid texture coords if inside bowl ellipse
+  const {cx,cy,rx,ry}=BOWL;
+  const inR=rx-14, inRy=ry-10;
+  const {FW,FH}=Fluid.getSize();
+  const nx=(pointer.x-cx)/inR, ny=(pointer.y-cy)/inRy;
+  const npx=(pointer.px-cx)/inR, npy=(pointer.py-cy)/inRy;
+  const inside = (nx*nx+ny*ny)<=1.05;
+  return {
+    inside,
+    fx:(nx*0.5+0.5)*FW, fy:(ny*0.5+0.5)*FH,
+    fpx:(npx*0.5+0.5)*FW, fpy:(npy*0.5+0.5)*FH
+  };
+}
+function updateMixEgg(dt){
+  const fc = fluidCoordsFromPointer();
+  let speed=0;
+  if(pointer.down && fc.inside){
+    const len = Fluid.smear(fc.fx,fc.fy,fc.fpx,fc.fpy);
+    speed = len||0;
+    // whisk angle follows motion
+    const ang = Math.atan2(pointer.vy, pointer.vx);
+    mixEgg.whiskAngle = lerp(mixEgg.whiskAngle, ang+Math.PI/2, 0.3);
+    // sound throttle
+    if(speed>3 && Math.random()<0.4) Sound.stir();
+    // spawn bubbles behind whisk
+    if(Math.random()<0.5){
+      mixEgg.bubbles.push({x:pointer.x+rand(-14,14),y:pointer.y+rand(-10,10),
+        r:rand(1.5,4),life:rand(500,1100),life0:1100,vy:rand(-0.02,-0.06)});
+    }
+    // splashes at high speed
+    if(speed>9 && Math.random()<0.3){
+      mixEgg.bubbles.push({x:pointer.x,y:pointer.y-8,r:rand(2,4),life:400,life0:400,
+        vy:-0.5,vx:rand(-0.2,0.2),splash:true});
+    }
+  }
+  if(pointer.down && fc.inside) Fluid.relax("egg", dt);
+  // update bubbles
+  for(let i=mixEgg.bubbles.length-1;i>=0;i--){
+    const b=mixEgg.bubbles[i];
+    b.y+=(b.vy||0)*dt; if(b.vx)b.x+=b.vx*dt;
+    if(b.splash){ b.vy+=0.04*dt; }
+    b.life-=dt; if(b.life<=0) mixEgg.bubbles.splice(i,1);
+  }
+  game.eggMix = Fluid.getProgress();
+}
+function drawMixEgg(){
+  drawBackground();
+  const prog = Fluid.getProgress();
+  drawInstruction(prog<0.95 ? "ホイッパーで ぐるぐる まぜてね！" : "きれいに まざったね！");
+  drawMeter("まぜまぜメーター", prog);
+
+  drawBowlBack();
+  drawFluidInBowl();
+  // bubbles on surface
+  ctx.save();
+  const {cx,cy,rx,ry}=BOWL;
+  ctx.beginPath(); ctx.ellipse(cx,cy,rx-14,ry-10,0,0,TAU); ctx.clip();
+  for(const b of mixEgg.bubbles){
+    const a=clamp(b.life/b.life0,0,1);
+    ctx.globalAlpha=a*0.8;
+    ctx.fillStyle="rgba(255,255,255,0.85)";
+    ctx.beginPath(); ctx.arc(b.x,b.y,b.r,0,TAU); ctx.fill();
+    ctx.globalAlpha=a*0.5;
+    ctx.strokeStyle="rgba(255,255,255,0.6)"; ctx.lineWidth=0.8;
+    ctx.beginPath(); ctx.arc(b.x,b.y,b.r,0,TAU); ctx.stroke();
+  }
+  ctx.globalAlpha=1;
+  ctx.restore();
+  drawBowlRim();
+
+  // whisk follows pointer (only draw when in/near bowl area)
+  const fc=fluidCoordsFromPointer();
+  const wx = pointer.down ? pointer.x : cx;
+  const wy = pointer.down ? pointer.y : cy-20;
+  drawWhisk(wx, wy, mixEgg.whiskAngle + (pointer.down?Math.sin(time*0.05)*0.1:0));
+
+  drawBanner();
+
+  if(prog>=0.95){
+    addButton({x:VW/2-120, y:VH*0.86, w:240, h:70, r:35,
+      text:"つぎへ", color:"#ffd24d", pulse:true,
+      onClick(){ setState(STATE.ADD_DRY); }});
+  } else {
+    // hint hand if idle
+    if(stateTime>2500 && !pointer.down){
+      ctx.save();
+      ctx.globalAlpha=0.5+Math.sin(time*0.006)*0.3;
+      ctx.font="bold 30px sans-serif"; ctx.textAlign="center";
+      ctx.fillText("👆 ぐるぐる", cx, cy+ry+50);
+      ctx.restore();
+    }
+  }
+}
+
+// ============================================================
+//  PHASE: ADD_DRY  (flour + milk pour animation)
+// ============================================================
+const addDry = { step:0, anim:0, floury:[], milkDrops:[] };
+function initAddDry(){
+  addDry.step=0; addDry.anim=0; addDry.floury=[]; addDry.milkDrops=[]; addDry.pouring=false;
+  showBanner("こなを いれよう！", 1600);
+}
+function updateAddDry(dt){
+  // step 0: tap to pour flour ; step 1: tap to pour milk ; step 2: next
+  if(addDry.pouring){
+    addDry.anim += dt;
+    const {cx,cy}=BOWL;
+    if(addDry.step===0){
+      // flour particles sprinkle
+      if(addDry.anim<1400 && Math.random()<0.8){
+        for(let i=0;i<3;i++)
+          addDry.floury.push({x:cx+rand(-50,50), y:cy-160, vy:rand(0.15,0.3),
+            r:rand(2,5), life:1400, settle:cy+rand(-20,20)});
+        if(Math.random()<0.2) Sound.pour();
+      }
+      if(addDry.anim>1700){ addDry.pouring=false; addDry.step=1; showBanner("ぎゅうにゅうを いれよう！",1600); }
+    } else if(addDry.step===1){
+      // milk stream
+      if(addDry.anim<1400){
+        addDry.milkDrops.push({x:cx+rand(-6,6), y:cy-160, vy:rand(0.4,0.6), r:rand(5,9), life:1000});
+        if(Math.random()<0.15) Sound.pour();
+      }
+      if(addDry.anim>1700){ addDry.pouring=false; addDry.step=2; }
+    }
+  }
+  // particle motion
+  for(let i=addDry.floury.length-1;i>=0;i--){
+    const f=addDry.floury[i]; f.y+=f.vy*dt; f.life-=dt;
+    if(f.y>=f.settle){ f.y=f.settle; f.vy=0; }
+    if(f.life<=0) addDry.floury.splice(i,1);
+  }
+  for(let i=addDry.milkDrops.length-1;i>=0;i--){
+    const m=addDry.milkDrops[i]; m.y+=m.vy*dt; m.life-=dt;
+    if(m.y>BOWL.cy){ m.life-=dt*3; }
+    if(m.life<=0) addDry.milkDrops.splice(i,1);
+  }
+}
+function drawAddDry(){
+  drawBackground();
+  let inst = addDry.step===0 ? "「こな」ボタンを おしてね！" :
+             addDry.step===1 ? "「ぎゅうにゅう」ボタンを おしてね！" :
+             "まぜる じゅんびOK！";
+  drawInstruction(inst);
+
+  drawBowlBack();
+  // show the mixed egg fluid as base in bowl
+  drawFluidInBowl();
+  // flour/milk in-flight
+  const {cx,cy,rx,ry}=BOWL;
+  ctx.save();
+  ctx.beginPath(); ctx.ellipse(cx,cy,rx-14,ry-10,0,0,TAU); ctx.clip();
+  for(const f of addDry.floury){
+    ctx.fillStyle="rgba(255,255,250,0.85)";
+    ctx.beginPath(); ctx.arc(f.x,f.y,f.r,0,TAU); ctx.fill();
+  }
+  for(const m of addDry.milkDrops){
+    ctx.fillStyle="rgba(255,255,255,0.9)";
+    ctx.beginPath(); ctx.ellipse(m.x,m.y,m.r*0.7,m.r,0,0,TAU); ctx.fill();
+  }
+  ctx.restore();
+
+  // pouring source above bowl
+  if(addDry.pouring){
+    if(addDry.step===0){
+      // flour bag
+      drawPourSource(cx, cy-200, "#f3e7c8", "こな");
+    } else {
+      drawPourSource(cx, cy-200, "#eaf4ff", "ぎゅうにゅう");
+      // milk stream
+      ctx.strokeStyle="rgba(255,255,255,0.85)"; ctx.lineWidth=8;
+      ctx.beginPath(); ctx.moveTo(cx, cy-170); ctx.lineTo(cx+Math.sin(time*0.02)*4, cy-60); ctx.stroke();
+    }
+  }
+  drawBowlRim();
+  drawBanner();
+
+  // buttons
+  if(addDry.step===0 && !addDry.pouring){
+    addButton({x:VW/2-110, y:VH*0.82, w:220, h:74, r:37,
+      text:"こな", sub:"サラサラ", color:"#f0d98a", pulse:true,
+      onClick(){ addDry.pouring=true; addDry.anim=0; }});
+  } else if(addDry.step===1 && !addDry.pouring){
+    addButton({x:VW/2-110, y:VH*0.82, w:220, h:74, r:37,
+      text:"ぎゅうにゅう", sub:"トクトク", color:"#bfe0ff", pulse:true, fontSize:26,
+      onClick(){ addDry.pouring=true; addDry.anim=0; }});
+  } else if(addDry.step===2){
+    addButton({x:VW/2-120, y:VH*0.82, w:240, h:74, r:37,
+      text:"まぜる！", color:"#ffd24d", pulse:true,
+      onClick(){ setState(STATE.MIX_BATTER); }});
+  }
+}
+function drawPourSource(x,y,color,label){
+  ctx.save();
+  ctx.translate(x,y); ctx.rotate(0.3);
+  ctx.fillStyle=color;
+  roundRect(-44,-30,88,60,14); ctx.fill();
+  ctx.fillStyle="rgba(0,0,0,0.1)";
+  roundRect(-44,10,88,20,8); ctx.fill();
+  ctx.restore();
+  ctx.fillStyle="#5a2a18"; ctx.font="bold 16px sans-serif"; ctx.textAlign="center";
+  ctx.fillText(label, x, y-40);
+}
+
+// ============================================================
+//  PHASE: MIX_BATTER  (lumps + overmix mechanic)
+// ============================================================
+const mixB = { whiskAngle:0, lumps:[], bubbles:[] };
+function initMixBatter(){
+  Fluid.reset("batter");
+  mixB.whiskAngle=0; mixB.bubbles=[]; mixB.lumps=[];
+  // create lumps in bowl coords
+  const {cx,cy,rx,ry}=BOWL;
+  for(let i=0;i<22;i++){
+    mixB.lumps.push({
+      x:cx+rand(-rx*0.6,rx*0.6), y:cy+rand(-ry*0.5,ry*0.5),
+      r:rand(4,10), alive:true, wob:rand(0,TAU)
+    });
+  }
+  showBanner("ダマを なくそう！", 1800);
+}
+function updateMixBatter(dt){
+  const fc = fluidCoordsFromPointer();
+  let speed=0;
+  if(pointer.down && fc.inside){
+    const len=Fluid.smear(fc.fx,fc.fy,fc.fpx,fc.fpy);
+    speed=len||0;
+    const ang=Math.atan2(pointer.vy,pointer.vx);
+    mixB.whiskAngle=lerp(mixB.whiskAngle, ang+Math.PI/2, 0.3);
+    if(speed>3 && Math.random()<0.35) Sound.stir();
+    // dissolve lumps near whisk
+    for(const l of mixB.lumps){
+      if(l.alive && dist(pointer.x,pointer.y,l.x,l.y)<34){
+        l.r -= 0.06*dt*(0.5+speed*0.05);
+        if(l.r<=1.5){ l.alive=false; Sound.bubble(); }
+      }
+    }
+    if(Math.random()<0.4){
+      mixB.bubbles.push({x:pointer.x+rand(-12,12),y:pointer.y+rand(-8,8),
+        r:rand(1.5,3.5),life:rand(400,900),life0:900});
+    }
+  }
+  if(pointer.down && fc.inside) Fluid.relax("batter", dt);
+  for(let i=mixB.bubbles.length-1;i>=0;i--){
+    const b=mixB.bubbles[i]; b.life-=dt; if(b.life<=0) mixB.bubbles.splice(i,1);
+  }
+  // compute remaining lumps & overmix
+  const remaining = mixB.lumps.filter(l=>l.alive).length;
+  game.lumps = remaining / mixB.lumps.length;
+  game.batterMix = Fluid.getProgress();
+  // overmix once well mixed AND keep stirring
+  if(Fluid.getProgress()>0.62 && pointer.down && fc.inside && speed>2){
+    game.overmix = clamp(game.overmix + 0.0008*dt, 0, 1);
+  }
+}
+function drawMixBatter(){
+  drawBackground();
+  const prog=Fluid.getProgress();
+  const remaining = mixB.lumps.filter(l=>l.alive).length;
+  let inst;
+  if(remaining>3) inst="ダマを ねらって まぜてね！";
+  else if(game.overmix>0.4) inst="まぜすぎちゅうい！とめよう！";
+  else inst="いいかんじ！「やめる」を おそう！";
+  drawInstruction(inst);
+  // meter with overmix zone
+  drawMeter("まぜまぜメーター", clamp(prog*0.6 + (1-game.lumps)*0.4,0,1), {start:0.78, end:1.0});
+
+  drawBowlBack();
+  drawFluidInBowl();
+  // lumps
+  const {cx,cy,rx,ry}=BOWL;
+  ctx.save();
+  ctx.beginPath(); ctx.ellipse(cx,cy,rx-14,ry-10,0,0,TAU); ctx.clip();
+  for(const l of mixB.lumps){
+    if(!l.alive) continue;
+    const w=1+Math.sin(time*0.01+l.wob)*0.1;
+    const g=ctx.createRadialGradient(l.x-l.r*0.3,l.y-l.r*0.3,1,l.x,l.y,l.r);
+    g.addColorStop(0,"rgba(255,255,250,0.95)"); g.addColorStop(1,"rgba(240,232,205,0.7)");
+    ctx.fillStyle=g;
+    ctx.beginPath(); ctx.ellipse(l.x,l.y,l.r*w,l.r,0,0,TAU); ctx.fill();
+  }
+  for(const b of mixB.bubbles){
+    const a=clamp(b.life/b.life0,0,1); ctx.globalAlpha=a*0.7;
+    ctx.fillStyle="rgba(255,255,255,0.8)";
+    ctx.beginPath(); ctx.arc(b.x,b.y,b.r,0,TAU); ctx.fill();
+  }
+  ctx.globalAlpha=1;
+  ctx.restore();
+  drawBowlRim();
+
+  const wx=pointer.down?pointer.x:cx;
+  const wy=pointer.down?pointer.y:cy-20;
+  drawWhisk(wx,wy, mixB.whiskAngle+(pointer.down?Math.sin(time*0.05)*0.1:0));
+  drawBanner();
+
+  // overmix warning flash
+  if(game.overmix>0.4){
+    ctx.save();
+    ctx.globalAlpha=0.2+Math.sin(time*0.02)*0.15;
+    ctx.fillStyle="#ff4d4d"; ctx.fillRect(0,0,VW,VH);
+    ctx.restore();
+  }
+
+  // can stop once lumps mostly gone
+  const canStop = remaining<=4 || prog>0.5;
+  addButton({x:VW/2-120, y:VH*0.86, w:240, h:70, r:35,
+    text:"やめる！", color: canStop?"#ffd24d":"#cfc6bd", pulse:canStop, enabled:canStop,
+    onClick(){ if(canStop) setState(STATE.POUR); }});
+}
+
+// ============================================================
+//  PHASE: POUR  (tilt bowl, batter flows into pan)
+// ============================================================
+const pour = { tilt:0, amount:0, blobs:[], spread:0 };
+function initPour(){
+  pour.tilt=0; pour.amount=0; pour.blobs=[]; pour.spread=0; pour.done=false;
+  showBanner("フライパンに ながそう！", 1800);
+}
+function updatePour(dt){
+  const {cx,cy}=PAN;
+  const holding = pointer.down;
+  pour.tilt = lerp(pour.tilt, holding && !pour.done ? 1 : 0, 0.08);
+  if(pour.tilt>0.5 && !pour.done && pour.amount<1.0){
+    // emit batter blobs from bowl lip
+    if(Math.random()<0.6){
+      pour.blobs.push({x:BOWLP.lipX+rand(-6,6), y:BOWLP.lipY, vy:rand(0.15,0.25),
+        r:rand(7,12), life:2500});
+    }
+    pour.amount += 0.0007*dt*(pour.tilt);
+    pour.spread = clamp(pour.amount,0,1);
+    if(Math.random()<0.08) Sound.pour();
+  }
+  // blob fall
+  for(let i=pour.blobs.length-1;i>=0;i--){
+    const b=pour.blobs[i]; b.vy+=0.0015*dt; b.y+=b.vy*dt; b.life-=dt;
+    if(b.y>PAN.cy){ b.life-=dt*4; }
+    if(b.life<=0) pour.blobs.splice(i,1);
+  }
+}
+// Pan geometry (side-ish view for pour)
+const PAN = { cx:VW/2, cy:VH*0.66, rx:150, ry:42 };
+const BOWLP = { x:VW*0.30, y:VH*0.30, lipX:VW*0.42, lipY:VH*0.36 };
+function drawPour(){
+  drawBackground();
+  drawInstruction(pour.amount<0.35 ? "ボウルを かたむけて ながそう！(おしっぱなし)" :
+                  pour.amount>0.85 ? "じゅうぶん！はなそう！" : "とろ〜り…");
+  // amount meter with sweet zone
+  drawMeter("りょう", pour.amount, {start:0.45, end:0.78});
+  // (sweet zone shown as the lighter region; over/under judged later)
+
+  // pan (top-down-ish ellipse)
+  drawPanSide();
+  // batter puddle in pan
+  const sp = easeOutCubic(pour.spread);
+  ctx.save();
+  ctx.translate(PAN.cx, PAN.cy);
+  ctx.scale(1,0.42);
+  const pr = 30 + sp*120;
+  const g=ctx.createRadialGradient(0,0,4,0,0,pr);
+  g.addColorStop(0,"#fdeeb8"); g.addColorStop(0.8,"#f6e0a0"); g.addColorStop(1,"#eccf86");
+  ctx.fillStyle=g;
+  ctx.beginPath(); ctx.arc(0,0,pr,0,TAU); ctx.fill();
+  ctx.fillStyle="rgba(255,255,255,0.3)";
+  ctx.beginPath(); ctx.arc(-pr*0.3,-pr*0.3,pr*0.3,0,TAU); ctx.fill();
+  ctx.restore();
+
+  // falling batter blobs / stream
+  for(const b of pour.blobs){
+    ctx.fillStyle="#f6e0a0";
+    ctx.beginPath(); ctx.ellipse(b.x,b.y,b.r*0.8,b.r,0,0,TAU); ctx.fill();
+  }
+  if(pour.tilt>0.5 && pour.amount<1){
+    // viscous stream
+    ctx.strokeStyle="#f6e0a0"; ctx.lineWidth=9; ctx.lineCap="round";
+    ctx.beginPath();
+    ctx.moveTo(BOWLP.lipX, BOWLP.lipY);
+    ctx.quadraticCurveTo(BOWLP.lipX+6, (BOWLP.lipY+PAN.cy)/2, PAN.cx-20, PAN.cy-6);
+    ctx.stroke();
+  }
+
+  // tilting bowl
+  drawTiltBowl(pour.tilt);
+  drawBanner();
+
+  if(pour.amount>=0.3){
+    addButton({x:VW/2-120, y:VH*0.85, w:240, h:70, r:35,
+      text:"やく！", color:"#ff8f5a", pulse:true,
+      onClick(){ pour.done=true; game.pourAmount=pour.amount; setState(STATE.COOK1); }});
+  }
+}
+function drawPanSide(){
+  ctx.save();
+  // handle
+  ctx.fillStyle="#3a3a3a";
+  roundRect(PAN.cx+PAN.rx-10, PAN.cy-12, 120, 24, 12); ctx.fill();
+  // pan body
+  ctx.translate(PAN.cx,PAN.cy);
+  ctx.scale(1,0.45);
+  ctx.fillStyle="#2b2b2b";
+  ctx.beginPath(); ctx.arc(0,8,PAN.rx,0,TAU); ctx.fill();
+  const g=ctx.createRadialGradient(0,0,10,0,0,PAN.rx);
+  g.addColorStop(0,"#4a4a4a"); g.addColorStop(1,"#1f1f1f");
+  ctx.fillStyle=g;
+  ctx.beginPath(); ctx.arc(0,0,PAN.rx,0,TAU); ctx.fill();
+  ctx.restore();
+}
+function drawTiltBowl(tilt){
+  ctx.save();
+  ctx.translate(BOWLP.x, BOWLP.y);
+  ctx.rotate(tilt*0.7);
+  ctx.scale(1,1);
+  // bowl body
+  ctx.beginPath();
+  ctx.ellipse(0,0,90,64,0,0,TAU);
+  const bg=ctx.createLinearGradient(-90,0,90,0);
+  bg.addColorStop(0,"#d8e8f2"); bg.addColorStop(0.5,"#f4fbff"); bg.addColorStop(1,"#bcd4e6");
+  ctx.fillStyle=bg; ctx.fill();
+  // batter remaining inside
+  ctx.save();
+  ctx.beginPath(); ctx.ellipse(0,6,78,48,0,0,TAU); ctx.clip();
+  ctx.fillStyle="#f6e0a0";
+  const lvl = 20 - pour.amount*30;
+  ctx.fillRect(-80, lvl, 160, 80);
+  ctx.restore();
+  ctx.lineWidth=8; ctx.strokeStyle="#eaf4fb";
+  ctx.beginPath(); ctx.ellipse(0,0,90,64,0,0,TAU); ctx.stroke();
+  ctx.restore();
+}
+
+// ============================================================
+//  PHASE: COOK1 / COOK2  (frying, bubbles, doneness)
+// ============================================================
+// Cook pan top-down
+const PANT = { cx:VW/2, cy:VH*0.46, r:170 };
+// pancake radius scales with how much batter was poured
+function cakeR(){ const a=clamp(game.pourAmount||0.6,0.15,1); return PANT.r*(0.45+0.42*a); }
+const cook = { heat:1, bubbles:[], holes:[], side:1, donenessKey:"doneness1", popReady:false };
+function initCook(side){
+  cook.heat=1; cook.bubbles=[]; cook.holes=[]; cook.side=side;
+  cook.donenessKey = side===1?"doneness1":"doneness2";
+  cook.popReady=false;
+  cook.flame=0;
+  if(side===1){
+    game.doneness1=0; showBanner("やいていこう！", 1600);
+  } else {
+    game.doneness2=0; showBanner("うらめんを やこう！", 1600);
+  }
+}
+function updateCook(dt){
+  const key=cook.donenessKey;
+  // doneness advances with heat
+  const heatRate = [0,0.00006,0.00011,0.00019][cook.heat]; // weak/med/strong
+  game[key] = clamp(game[key] + heatRate*dt*60/1000*16.6, 0, 1.4);
+  // bubble generation depends on doneness (more as it cooks, side 1)
+  const d=game[key];
+  // sizzle ambient
+  if(Math.random() < 0.04*cook.heat) Sound.sizzle(0.04+cook.heat*0.02);
+  // bubbles form on top surface (only meaningful on side1 cooking before flip)
+  const bubbleRate = clamp((d-0.15)*1.2,0,1) * cook.heat * 0.5;
+  if(cook.side===1 && Math.random()<bubbleRate){
+    const ang=rand(0,TAU), rr=rand(0,cakeR()*0.85);
+    cook.bubbles.push({
+      x:PANT.cx+Math.cos(ang)*rr, y:PANT.cy+Math.sin(ang)*rr,
+      r:1, max:rand(4,9), grow:rand(0.004,0.01), state:0, t:0, popAt:rand(800,1800)
+    });
+  }
+  // update bubbles
+  let popped=0;
+  for(let i=cook.bubbles.length-1;i>=0;i--){
+    const b=cook.bubbles[i]; b.t+=dt;
+    if(b.r<b.max) b.r += b.grow*dt;
+    if(b.t>b.popAt){
+      // pop -> leave a hole
+      cook.holes.push({x:b.x,y:b.y,r:b.r*0.8,life:4000,life0:4000});
+      if(Math.random()<0.5) Sound.bubble();
+      cook.bubbles.splice(i,1); popped++;
+    }
+  }
+  for(let i=cook.holes.length-1;i>=0;i--){
+    cook.holes[i].life-=dt; if(cook.holes[i].life<=0) cook.holes.splice(i,1);
+  }
+  // "flip time" signal when many bubbles have formed/popped (side1)
+  cook.popReady = (game[key]>0.45 && cook.bubbles.length>6);
+  cook.flame += dt*0.02;
+}
+function donenessColor(d){
+  // 0 white batter -> golden -> brown -> dark -> black
+  // returns {r,g,b}
+  d=clamp(d,0,1.4);
+  const stops=[
+    [0.00, [250,238,184]],  // raw pale
+    [0.30, [240,200,120]],  // light gold
+    [0.55, [214,150,70]],   // kitsune
+    [0.80, [170,98,40]],    // congari brown
+    [1.00, [110,60,28]],    // dark brown
+    [1.25, [60,38,24]],     // burnt
+    [1.40, [30,22,18]]      // black
+  ];
+  for(let i=0;i<stops.length-1;i++){
+    if(d<=stops[i+1][0]){
+      const t=(d-stops[i][0])/(stops[i+1][0]-stops[i][0]);
+      const a=stops[i][1], b=stops[i+1][1];
+      return [lerp(a[0],b[0],t)|0, lerp(a[1],b[1],t)|0, lerp(a[2],b[2],t)|0];
+    }
+  }
+  return stops[stops.length-1][1];
+}
+// noise cache for cook mottling
+let noiseCanvas=null;
+function buildNoise(){
+  noiseCanvas=document.createElement("canvas");
+  noiseCanvas.width=PANT.r*2; noiseCanvas.height=PANT.r*2;
+  const x=noiseCanvas.getContext("2d");
+  const img=x.createImageData(noiseCanvas.width, noiseCanvas.height);
+  for(let i=0;i<img.data.length;i+=4){
+    const v=Math.random()*255;
+    img.data[i]=img.data[i+1]=img.data[i+2]=v;
+    img.data[i+3]= Math.random()*60; // sparse mottle
+  }
+  x.putImageData(img,0,0);
+}
+function drawPancakeTop(cx,cy,r,doneness,withBubbles,withHoles){
+  const col=donenessColor(doneness);
+  ctx.save();
+  // base disk
+  const g=ctx.createRadialGradient(cx,cy,r*0.2,cx,cy,r);
+  g.addColorStop(0,`rgb(${clamp(col[0]+18,0,255)},${clamp(col[1]+14,0,255)},${clamp(col[2]+8,0,255)})`);
+  g.addColorStop(0.7,`rgb(${col[0]},${col[1]},${col[2]})`);
+  g.addColorStop(1,`rgb(${clamp(col[0]-28,0,255)},${clamp(col[1]-24,0,255)},${clamp(col[2]-16,0,255)})`);
+  ctx.fillStyle=g;
+  ctx.beginPath(); ctx.arc(cx,cy,r,0,TAU); ctx.fill();
+  // mottling noise
+  if(noiseCanvas){
+    ctx.save();
+    ctx.beginPath(); ctx.arc(cx,cy,r,0,TAU); ctx.clip();
+    ctx.globalAlpha=clamp(doneness*0.5,0.05,0.4);
+    ctx.globalCompositeOperation="multiply";
+    ctx.drawImage(noiseCanvas, cx-r, cy-r, r*2, r*2);
+    ctx.restore();
+  }
+  // darker edge ring (cooks faster at rim)
+  ctx.globalAlpha=clamp(doneness*0.6,0,0.6);
+  ctx.strokeStyle=`rgb(${clamp(col[0]-50,0,255)},${clamp(col[1]-44,0,255)},${clamp(col[2]-30,0,255)})`;
+  ctx.lineWidth=r*0.08;
+  ctx.beginPath(); ctx.arc(cx,cy,r*0.96,0,TAU); ctx.stroke();
+  ctx.globalAlpha=1;
+  // glossy raw-batter highlight when undercooked
+  if(doneness<0.4){
+    ctx.globalAlpha=(0.4-doneness)*1.2;
+    ctx.fillStyle="rgba(255,255,235,0.5)";
+    ctx.beginPath(); ctx.ellipse(cx-r*0.25,cy-r*0.25,r*0.4,r*0.2,-0.5,0,TAU); ctx.fill();
+    ctx.globalAlpha=1;
+  }
+  // holes (popped bubbles)
+  if(withHoles){
+    for(const h of cook.holes){
+      const a=clamp(h.life/h.life0,0,1);
+      ctx.globalAlpha=a*0.6;
+      ctx.fillStyle=`rgb(${clamp(col[0]-40,0,255)},${clamp(col[1]-36,0,255)},${clamp(col[2]-24,0,255)})`;
+      ctx.beginPath(); ctx.arc(h.x,h.y,h.r,0,TAU); ctx.fill();
+    }
+    ctx.globalAlpha=1;
+  }
+  // bubbles (raised)
+  if(withBubbles){
+    for(const b of cook.bubbles){
+      ctx.fillStyle="rgba(255,250,230,0.6)";
+      ctx.beginPath(); ctx.arc(b.x,b.y,b.r,0,TAU); ctx.fill();
+      ctx.fillStyle="rgba(255,255,255,0.5)";
+      ctx.beginPath(); ctx.arc(b.x-b.r*0.3,b.y-b.r*0.3,b.r*0.4,0,TAU); ctx.fill();
+    }
+  }
+  ctx.restore();
+}
+function drawCookPan(){
+  // pan top-down
+  ctx.save();
+  ctx.fillStyle="#1f1f1f";
+  ctx.beginPath(); ctx.arc(PANT.cx, PANT.cy, PANT.r+24, 0, TAU); ctx.fill();
+  const g=ctx.createRadialGradient(PANT.cx,PANT.cy,20,PANT.cx,PANT.cy,PANT.r+24);
+  g.addColorStop(0,"#3c3c3c"); g.addColorStop(1,"#161616");
+  ctx.fillStyle=g;
+  ctx.beginPath(); ctx.arc(PANT.cx,PANT.cy,PANT.r+10,0,TAU); ctx.fill();
+  // inner shine
+  ctx.strokeStyle="rgba(255,255,255,0.08)"; ctx.lineWidth=6;
+  ctx.beginPath(); ctx.arc(PANT.cx,PANT.cy,PANT.r-6,0,TAU); ctx.stroke();
+  ctx.restore();
+  // handle
+  ctx.save();
+  ctx.fillStyle="#2a2a2a";
+  roundRect(PANT.cx-30, PANT.cy+PANT.r+10, 60, 110, 18); ctx.fill();
+  ctx.restore();
+}
+function drawFlames(){
+  // flames under pan, intensity by heat
+  const n = cook.heat*7;
+  ctx.save();
+  for(let i=0;i<n;i++){
+    const ang = (i/n)*TAU;
+    const fx=PANT.cx+Math.cos(ang)*(PANT.r-6);
+    const fy=PANT.cy+Math.sin(ang)*(PANT.r-6)+PANT.r*0.0;
+    const h = 14+Math.sin(cook.flame+i)*6 + cook.heat*6;
+    const grad=ctx.createLinearGradient(fx,fy+h,fx,fy-h);
+    grad.addColorStop(0,"rgba(255,80,0,0)");
+    grad.addColorStop(0.5,"rgba(255,140,0,0.5)");
+    grad.addColorStop(1,"rgba(255,230,80,0.0)");
+    ctx.fillStyle=grad;
+    ctx.beginPath();
+    ctx.moveTo(fx-6,fy);
+    ctx.quadraticCurveTo(fx, fy-h, fx+6, fy);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+function drawCook(side){
+  drawBackground();
+  const key=cook.donenessKey;
+  let inst;
+  if(side===1){
+    inst = cook.popReady ? "あわが いっぱい！ひっくりかえしどき！" : "あわが でるまで まってね…";
+  } else {
+    inst = game[key]<0.5 ? "もうちょっと やこう…" : "やけたら おさらに のせよう！";
+  }
+  drawInstruction(inst);
+  // doneness meter
+  drawMeter(side===1?"うらめんの やけぐあい":"おもてめんの やけぐあい", clamp(game[key]/1.1,0,1), {start:0.78,end:1.0});
+
+  // flames behind
+  drawFlames();
+  drawCookPan();
+  // pancake
+  drawPancakeTop(PANT.cx, PANT.cy, cakeR(), game[key], side===1, true);
+
+  drawBanner();
+
+  // heat buttons row
+  const by=VH*0.80, bw=118, gap=10;
+  const labels=[["よわび","🔥",1,"#ffd98a"],["ちゅうび","🔥🔥",2,"#ff9d4d"],["つよび","🔥🔥🔥",3,"#ff5a3d"]];
+  const totalW=bw*3+gap*2; let bx=(VW-totalW)/2;
+  for(const L of labels){
+    const sel=cook.heat===L[2];
+    addButton({x:bx,y:by,w:bw,h:64,r:18,text:L[0],sub:L[1],
+      color: sel?L[3]:"#e8ddd0", fontSize:22,
+      onClick(){ cook.heat=L[2]; }});
+    bx+=bw+gap;
+  }
+
+  // action button
+  if(side===1){
+    addButton({x:VW/2-130, y:VH*0.90, w:260, h:66, r:33,
+      text:"ひっくりかえす！", color:"#ff8fb1", pulse:cook.popReady, fontSize:26,
+      onClick(){ startFlip(); }});
+    if(stateTime>1000){
+      ctx.save(); ctx.fillStyle="#5a2a18"; ctx.font="14px sans-serif"; ctx.textAlign="center";
+      ctx.fillText("うえに スワイプ でも OK", VW/2, VH*0.90-8);
+      ctx.restore();
+    }
+  } else {
+    const ready=game[key]>0.45;
+    addButton({x:VW/2-130, y:VH*0.90, w:260, h:66, r:33,
+      text:"おさらにのせる", color: ready?"#ffd24d":"#cfc6bd", pulse:ready, enabled:ready, fontSize:26,
+      onClick(){ if(ready) setState(STATE.RESULT); }});
+  }
+}
+
+// ============================================================
+//  PHASE: FLIP
+// ============================================================
+const flip = { t:0, dur:900, height:0, rot:0, startDone:0, judged:false };
+function startFlip(){
+  // capture timing quality from how cooked side1 is
+  // ideal doneness around 0.55-0.75
+  const d=game.doneness1;
+  let result, q;
+  if(d<0.35){ result="early"; q=clamp(d/0.35,0,1)*0.5; }
+  else if(d>0.95){ result="late"; q=clamp(1-(d-0.95)/0.45,0,1)*0.6; }
+  else {
+    // closeness to 0.65 center
+    const closeness = 1 - Math.abs(d-0.65)/0.30;
+    q=clamp(closeness,0,1);
+    result = q>0.55 ? "nice" : "ok";
+  }
+  game.flipResult=result; game.flipQuality=q; game.flipTiming=d;
+  flip.t=0; flip.judged=false; flip.startDone=d;
+  Sound.flip();
+  setState(STATE.FLIP);
+}
+function updateFlip(dt){
+  flip.t += dt;
+  const p = clamp(flip.t/flip.dur,0,1);
+  // parabola height
+  flip.height = Math.sin(p*Math.PI) * 230;
+  // rotation (one full flip)
+  flip.rot = p*Math.PI;
+  if(!flip.judged && p>0.5){
+    flip.judged=true;
+    if(game.flipResult==="nice"){
+      showBanner("ナイスフリップ！", 1500);
+      // sparkles
+      for(let i=0;i<22;i++){
+        spawnParticle({type:"star", x:PANT.cx+rand(-60,60), y:PANT.cy-100+rand(-40,40),
+          vx:rand(-0.15,0.15), vy:rand(-0.2,0.05), g:0.0008,
+          r:rand(6,14), rot:rand(0,TAU), spin:rand(-0.02,0.02),
+          color: Math.random()<0.5?"#fff36b":"#ffd24d", life:1200, life0:1200});
+      }
+      Sound.sparkle(); Sound.win();
+    } else if(game.flipResult==="early"){
+      showBanner("はやすぎた！どろっ…", 1500);
+    } else if(game.flipResult==="late"){
+      showBanner("ちょっと こげた！", 1500);
+    } else {
+      showBanner("ひっくりかえせた！", 1400);
+    }
+  }
+  if(p>=1){
+    setState(STATE.COOK2);
+  }
+}
+function drawFlip(){
+  drawBackground();
+  drawInstruction("ひっくりかえす！");
+  drawFlames();
+  drawCookPan();
+  const p=clamp(flip.t/flip.dur,0,1);
+  // shadow on pan (shrinks as it rises)
+  const sh=1-Math.sin(p*Math.PI)*0.6;
+  ctx.save();
+  ctx.globalAlpha=0.3*sh;
+  ctx.fillStyle="#000";
+  ctx.beginPath();
+  ctx.ellipse(PANT.cx, PANT.cy+10, PANT.r*0.7*sh, PANT.r*0.28*sh,0,0,TAU);
+  ctx.fill();
+  ctx.restore();
+  // flying pancake (vertical scale = cos(rot) -> flip illusion)
+  const cx=PANT.cx, cy=PANT.cy - flip.height;
+  const flatten=Math.cos(flip.rot);
+  ctx.save();
+  ctx.translate(cx,cy);
+  ctx.scale(1, Math.max(0.12, Math.abs(flatten)));
+  // which side shows
+  const showBottom = flatten<0;
+  const dd = showBottom ? game.doneness1 : (game.doneness2||0.05);
+  // early/late deform
+  let rr=cakeR()*0.95;
+  if(game.flipResult==="early"){
+    // droopy / splatter
+    rr *= 1+Math.sin(time*0.02)*0.06;
+  }
+  const col=donenessColor(showBottom?game.doneness1:0.08);
+  const g=ctx.createRadialGradient(0,0,rr*0.2,0,0,rr);
+  g.addColorStop(0,`rgb(${clamp(col[0]+18,0,255)},${clamp(col[1]+14,0,255)},${clamp(col[2]+8,0,255)})`);
+  g.addColorStop(1,`rgb(${col[0]},${col[1]},${col[2]})`);
+  ctx.fillStyle=g;
+  ctx.beginPath(); ctx.arc(0,0,rr,0,TAU); ctx.fill();
+  if(noiseCanvas && (showBottom?game.doneness1:0)>0.2){
+    ctx.save(); ctx.beginPath(); ctx.arc(0,0,rr,0,TAU); ctx.clip();
+    ctx.globalAlpha=0.3; ctx.globalCompositeOperation="multiply";
+    ctx.drawImage(noiseCanvas,-rr,-rr,rr*2,rr*2); ctx.restore();
+  }
+  ctx.restore();
+
+  // early splatter droplets
+  if(game.flipResult==="early" && p>0.5 && Math.random()<0.3){
+    spawnParticle({x:cx+rand(-40,40),y:cy+rand(-10,20),vx:rand(-0.2,0.2),vy:rand(0,0.3),g:0.002,
+      r:rand(3,7),life:500,life0:500,color:"#f3e0a0"});
+  }
+  drawParticles();
+  drawBanner();
+}
+
+// ============================================================
+//  PHASE: RESULT (plate, butter, syrup, scoring)
+// ============================================================
+const result = { t:0, butter:0, syrup:0, stars:0, comment:"", subcomments:[] };
+function initResult(){
+  result.t=0; result.butter=0; result.syrup=0;
+  computeScore();
+  Sound.win();
+  showBanner("できあがり！", 2000);
+}
+function computeScore(){
+  // 1) mix quality (egg + batter)
+  const mixScore = clamp((game.eggMix*0.5 + game.batterMix*0.5),0,1);
+  // 2) lumps (fewer better) and overmix penalty
+  const lumpScore = clamp(1 - game.lumps, 0, 1);
+  const overmixPenalty = game.overmix; // 0..1
+  // 3) flip timing
+  const flipScore = game.flipQuality;
+  // 4) doneness both sides — ideal around 0.7
+  function doneScore(d){ return clamp(1 - Math.abs(clamp(d,0,1.4)-0.72)/0.5, 0, 1); }
+  const cookScore = (doneScore(game.doneness1)+doneScore(game.doneness2))/2;
+
+  // 5) pour amount — sweet zone matches the pour meter
+  const amt=clamp(game.pourAmount,0,1);
+  const sizeScore = (amt>=0.45&&amt<=0.78)?1:clamp(1-Math.abs(amt-0.62)/0.45,0,1);
+  const total = (mixScore*0.20 + lumpScore*0.18 + flipScore*0.26 + cookScore*0.26 + sizeScore*0.10) - overmixPenalty*0.2;
+  const tc = clamp(total,0,1);
+  result.stars = tc>0.78?3 : tc>0.5?2 : 1;
+
+  // main comment
+  const avgDone=(game.doneness1+game.doneness2)/2;
+  let main;
+  if(result.stars===3) main="ふわふわで さいこう！🥞";
+  else if(result.stars===2) main="こんがり おいしそう！";
+  else main="つぎは もっと じょうずに！";
+  result.comment=main;
+
+  // sub comments (detailed feedback, hiragana)
+  const subs=[];
+  if(avgDone>1.05) subs.push("ちょっと こげちゃった…");
+  else if(avgDone<0.35) subs.push("やきが あまいかも？");
+  else subs.push("やきいろ ばっちり！");
+  if(game.lumps>0.4) subs.push("ダマが のこってたよ");
+  else subs.push("なめらかな きじ！");
+  if(game.pourAmount<0.45) subs.push("ちょっと ちいさめだったね");
+  else if(game.pourAmount>0.78) subs.push("おおきく やけたね！");
+  if(game.overmix>0.4) subs.push("まぜすぎ ちゅうい！");
+  if(game.flipResult==="nice") subs.push("フリップ かんぺき！");
+  else if(game.flipResult==="early") subs.push("フリップ はやかったね");
+  else if(game.flipResult==="late") subs.push("フリップ おそかったね");
+  result.subcomments=subs.slice(0,3);
+}
+function updateResult(dt){
+  result.t+=dt;
+  if(result.t>700) result.butter=clamp((result.t-700)/1500,0,1);
+  if(result.t>1600) result.syrup=clamp((result.t-1600)/1800,0,1);
+}
+function drawResult(){
+  drawBackground();
+  drawInstruction("けっか はっぴょう！");
+
+  // plate
+  const cx=VW/2, cy=VH*0.40;
+  ctx.save();
+  ctx.translate(cx,cy+70); ctx.scale(1,0.32);
+  ctx.fillStyle="rgba(0,0,0,0.18)";
+  ctx.beginPath(); ctx.arc(0,0,180,0,TAU); ctx.fill();
+  ctx.restore();
+  ctx.save();
+  ctx.translate(cx,cy+50); ctx.scale(1,0.34);
+  const pg=ctx.createRadialGradient(0,0,30,0,0,180);
+  pg.addColorStop(0,"#ffffff"); pg.addColorStop(0.8,"#f0f0f5"); pg.addColorStop(1,"#cfd2dc");
+  ctx.fillStyle=pg; ctx.beginPath(); ctx.arc(0,0,180,0,TAU); ctx.fill();
+  ctx.fillStyle="#ffffff"; ctx.beginPath(); ctx.arc(0,0,130,0,TAU); ctx.fill();
+  ctx.restore();
+
+  // pancake stack (two cakes using both doneness)
+  drawStackedPancake(cx, cy, game.doneness2, game.doneness1);
+
+  // butter (melting square)
+  if(result.butter>0){
+    const b=result.butter;
+    ctx.save();
+    ctx.translate(cx, cy-26);
+    const sz=26*(1-b*0.3);
+    const melt=b;
+    // melted pool
+    ctx.fillStyle="rgba(255,210,90,"+(0.5*melt)+")";
+    ctx.beginPath(); ctx.ellipse(0,8,28*melt+10,12*melt+4,0,0,TAU); ctx.fill();
+    // butter block
+    const bg=ctx.createLinearGradient(-sz,-sz,sz,sz);
+    bg.addColorStop(0,"#fff3b0"); bg.addColorStop(1,"#ffd95a");
+    ctx.fillStyle=bg;
+    roundRect(-sz/2,-sz/2-(1-melt)*6, sz, sz*(1-melt*0.5), 4); ctx.fill();
+    ctx.fillStyle="rgba(255,255,255,0.5)";
+    roundRect(-sz/2+2,-sz/2+1, sz*0.4, 4, 2); ctx.fill();
+    ctx.restore();
+  }
+
+  // syrup drizzle
+  if(result.syrup>0){
+    const s=easeOutCubic(result.syrup);
+    ctx.save();
+    ctx.translate(cx,cy);
+    ctx.fillStyle="rgba(150,80,20,0.55)";
+    // top glossy pool
+    ctx.beginPath(); ctx.ellipse(0,-20,70*s,22*s,0,0,TAU); ctx.fill();
+    // drips down the sides
+    ctx.strokeStyle="rgba(150,80,20,0.6)"; ctx.lineWidth=6; ctx.lineCap="round";
+    const drips=[[-50,40],[40,30],[-10,55]];
+    for(let i=0;i<drips.length;i++){
+      const dl = s* (30+i*8);
+      ctx.beginPath();
+      ctx.moveTo(drips[i][0], -16);
+      ctx.lineTo(drips[i][0], -16+dl);
+      ctx.stroke();
+      ctx.fillStyle="rgba(150,80,20,0.6)";
+      ctx.beginPath(); ctx.arc(drips[i][0], -16+dl, 5, 0, TAU); ctx.fill();
+    }
+    // gloss highlight
+    ctx.fillStyle="rgba(255,230,180,0.4)";
+    ctx.beginPath(); ctx.ellipse(-18,-26,20*s,6*s,0,0,TAU); ctx.fill();
+    ctx.restore();
+  }
+
+  drawParticles();
+
+  // stars
+  const starY=cy+170;
+  for(let i=0;i<3;i++){
+    const sx=cx-70+i*70;
+    const got = i<result.stars;
+    const pop = result.t>1800+i*200;
+    let sc=1;
+    if(pop){
+      const e=(result.t-(1800+i*200))/300;
+      sc = e<1 ? 1+ (1-easeOutCubic(clamp(e,0,1)))*0.6 : 1;
+      if(e>0 && e<0.06 && got) Sound.sparkle();
+    } else sc=0;
+    ctx.save(); ctx.translate(sx,starY); ctx.scale(sc,sc);
+    drawStar(0,0,30,13,5, got?"#ffd54d":"#d8cfc4");
+    if(got){ ctx.strokeStyle="#ffae00"; ctx.lineWidth=2; ctx.stroke?.(); }
+    ctx.restore();
+  }
+
+  // comment box
+  ctx.save();
+  ctx.textAlign="center";
+  ctx.fillStyle="#fff";
+  roundRect(VW/2-180, starY+50, 360, 130, 22); ctx.fill();
+  ctx.strokeStyle="#ffb86c"; ctx.lineWidth=3;
+  roundRect(VW/2-180, starY+50, 360, 130, 22); ctx.stroke();
+  ctx.fillStyle="#e8542c"; ctx.font="bold 28px sans-serif";
+  ctx.fillText(result.comment, VW/2, starY+86);
+  ctx.fillStyle="#7a5236"; ctx.font="bold 17px sans-serif";
+  for(let i=0;i<result.subcomments.length;i++){
+    ctx.fillText("・"+result.subcomments[i], VW/2, starY+118+i*22);
+  }
+  ctx.restore();
+
+  addButton({x:VW/2-130, y:VH*0.88, w:260, h:72, r:36,
+    text:"もういちど", color:"#7bdc6a", pulse:true, fontSize:30,
+    onClick(){ resetGame(); setState(STATE.TITLE); }});
+
+  drawBanner();
+}
+function drawStackedPancake(cx,cy,dTop,dBottom){
+  // two stacked cakes, slight offset, with thickness
+  function cake(yy, d, r){
+    const col=donenessColor(d);
+    // side (thickness)
+    ctx.save();
+    ctx.fillStyle=`rgb(${clamp(col[0]-30,0,255)},${clamp(col[1]-26,0,255)},${clamp(col[2]-18,0,255)})`;
+    ctx.beginPath(); ctx.ellipse(cx,yy+14,r,r*0.34,0,0,TAU); ctx.fill();
+    ctx.fillRect(cx-r, yy, r*2, 14);
+    ctx.beginPath(); ctx.ellipse(cx,yy+14,r,r*0.34,0,0,Math.PI);
+    // top
+    ctx.restore();
+    ctx.save();
+    const g=ctx.createRadialGradient(cx,yy,r*0.2,cx,yy,r);
+    g.addColorStop(0,`rgb(${clamp(col[0]+16,0,255)},${clamp(col[1]+12,0,255)},${clamp(col[2]+6,0,255)})`);
+    g.addColorStop(1,`rgb(${col[0]},${col[1]},${col[2]})`);
+    ctx.fillStyle=g;
+    ctx.beginPath(); ctx.ellipse(cx,yy,r,r*0.34,0,0,TAU); ctx.fill();
+    if(noiseCanvas && d>0.2){
+      ctx.beginPath(); ctx.ellipse(cx,yy,r,r*0.34,0,0,TAU); ctx.clip();
+      ctx.globalAlpha=0.3; ctx.globalCompositeOperation="multiply";
+      ctx.drawImage(noiseCanvas, cx-r, yy-r*0.34, r*2, r*0.68);
+    }
+    ctx.restore();
+  }
+  const sc=0.75+0.45*clamp(game.pourAmount||0.6,0.2,1);
+  cake(cy+14, dBottom, 120*sc);
+  cake(cy-10, dTop, 116*sc);
+}
+
+// ============================================================
+//  STATE DISPATCH
+// ============================================================
+function onEnterState(s){
+  clearButtons();
+  switch(s){
+    case STATE.CRACK: initCrack(); break;
+    case STATE.MIX_EGG: initMixEgg(); break;
+    case STATE.ADD_DRY: initAddDry(); break;
+    case STATE.MIX_BATTER: initMixBatter(); break;
+    case STATE.POUR: initPour(); break;
+    case STATE.COOK1: initCook(1); break;
+    case STATE.FLIP: /* set up in startFlip */ break;
+    case STATE.COOK2: initCook(2); break;
+    case STATE.RESULT: initResult(); break;
+  }
+}
+function updateState(dt){
+  switch(state){
+    case STATE.TITLE: updateTitle(dt); break;
+    case STATE.CRACK: updateCrack(dt); break;
+    case STATE.MIX_EGG: updateMixEgg(dt); break;
+    case STATE.ADD_DRY: updateAddDry(dt); break;
+    case STATE.MIX_BATTER: updateMixBatter(dt); break;
+    case STATE.POUR: updatePour(dt); break;
+    case STATE.COOK1: updateCook(dt); checkSwipeFlip(); break;
+    case STATE.FLIP: updateFlip(dt); break;
+    case STATE.COOK2: updateCook(dt); break;
+    case STATE.RESULT: updateResult(dt); break;
+  }
+}
+function drawState(){
+  switch(state){
+    case STATE.TITLE: drawTitle(); break;
+    case STATE.CRACK: drawCrack(); break;
+    case STATE.MIX_EGG: drawMixEgg(); break;
+    case STATE.ADD_DRY: drawAddDry(); break;
+    case STATE.MIX_BATTER: drawMixBatter(); break;
+    case STATE.POUR: drawPour(); break;
+    case STATE.COOK1: drawCook(1); break;
+    case STATE.FLIP: drawFlip(); break;
+    case STATE.COOK2: drawCook(2); break;
+    case STATE.RESULT: drawResult(); break;
+  }
+}
+// swipe-up to flip during COOK1
+let swipeStartY=null, swipeStartT=0;
+function checkSwipeFlip(){
+  if(pointer.justDown){ swipeStartY=pointer.y; swipeStartT=time; }
+  if(pointer.down && swipeStartY!==null){
+    if(swipeStartY - pointer.y > 110 && time-swipeStartT<400){
+      swipeStartY=null;
+      startFlip();
+    }
+  }
+  if(pointer.justUp) swipeStartY=null;
+}
+
+// ---------- Mute button ----------
+function drawMuteButton(){
+  const x=VW-54, y=12, s=42;
+  addButton({x,y,w:s,h:s,r:12, text: Sound.isMuted()?"🔇":"🔊", color:"#ffffff", fontSize:22,
+    onClick(){ Sound.setMuted(!Sound.isMuted()); }});
+}
+
+// ============================================================
+//  MAIN LOOP
+// ============================================================
+let lastT=performance.now();
+function frame(now){
+  const dt=Math.min(now-lastT, 50); // clamp dt to avoid jumps
+  lastT=now; time=now;
+  stateTime+=dt;
+
+  pointerBegin();
+  clearButtons();
+
+  // background fill (letterbox)
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,VW,VH);
+
+  updateState(dt);
+  drawState();
+  drawMuteButton();
+  drawButtons();
+  processButtons();
+
+  pointerEnd();
+  requestAnimationFrame(frame);
+}
+
+// ---------- Boot ----------
+function boot(){
+  resize();
+  buildBackground();
+  buildNoise();
+  // initial pointer center
+  pointer.x=VW/2; pointer.y=VH/2; pointer.px=VW/2; pointer.py=VH/2;
+  requestAnimationFrame(frame);
+}
+boot();
+
+})();
+</script>
+</body>
+</html>
